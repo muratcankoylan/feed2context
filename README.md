@@ -5,7 +5,7 @@ One‑click feed → report for LinkedIn and X. Capture a post, auto‑shape a r
 - LinkedIn extraction: Groq Compound Mini visits the URL and returns only the post text.
 - X extraction: Browser Use drives a real browser to read the post (X blocks scraping reliably).
 - Query building: Kimi‑K2 compresses the goal into a single effective search query.
-- Research and answer: Groq Compound searches and reasons to produce a high‑quality answer.
+- Research and answer: Groq Compound searches and reasons to produce an instant research report.
 
 Groq Compound: https://groq.com/blog/introducing-the-next-generation-of-compound-on-groqcloud
 
