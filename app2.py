@@ -17,6 +17,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from fastapi.responses import JSONResponse, HTMLResponse
 
+# Browser Use imports
+from browser_use import Agent, ChatGroq, BrowserProfile
+
+# Speed optimization instructions for the model (used by Browser Use Agent)
+SPEED_OPTIMIZATION_PROMPT = """
+Speed optimization instructions:
+- Be concise and direct in your responses
+- Get to the goal as quickly as possible
+- Use multi-action sequences whenever possible to reduce steps
+"""
+
 
 def _append_jsonl(path: str, data: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -37,7 +48,7 @@ def _groq() -> Optional[Groq]:
 
 # 1) Extract post content with Compound Mini (supports LinkedIn and X)
 EXTRACTOR_SYSTEM = """You are PostExtractor. Visit the given social post URL (LinkedIn or X) and return ONLY the main post text.
-Input: {"post_url": "..."}
+Input: The user will provide a URL directly.
 Rules:
 - Return ONLY JSON: {"post_text": "..."}
 - Exclude reactions, counts, and comments; include text from 'see more' / collapsed content if applicable
@@ -55,7 +66,7 @@ def _extract_post_with_kimi(post_url: str) -> Optional[str]:
             model='groq/compound-mini',  # use Compound Mini for URL extraction
             messages=[
                 {"role": "system", "content": EXTRACTOR_SYSTEM},
-                {"role": "user", "content": json.dumps({"post_url": post_url}, ensure_ascii=False)},
+                {"role": "user", "content": post_url},  # Pass URL directly for compound-mini to visit
             ],
             temperature=0.0,
         )
@@ -68,8 +79,178 @@ def _extract_post_with_kimi(post_url: str) -> Optional[str]:
     return None
 
 
+# 1b) Extract X post content with Browser Use
+async def _extract_x_post_with_browser_use(post_url: str) -> Optional[str]:
+    """Extract X post content using Browser Use Agent with Groq"""
+    try:
+        # Ensure GROQ_API_KEY is available in env (ChatGroq reads from env)
+        if not os.getenv('GROQ_API_KEY'):
+            print("No GROQ_API_KEY found for Browser Use")
+            return None
+
+        # Initialize Groq LLM for Browser Use (no explicit api_key; uses env)
+        llm = ChatGroq(
+            model='meta-llama/llama-4-maverick-17b-128e-instruct',
+            temperature=0.0,
+        )
+
+        # Create a speed-optimized browser profile
+        browser_profile = BrowserProfile(
+            minimum_wait_page_load_time=0.5,
+            wait_between_actions=0.5,
+            headless=False,
+        )
+        
+        # Define extraction task - include author name and tweet text
+        task = f"""
+        Navigate to this X/Twitter post: {post_url}
+        
+        Extract the following information:
+        1. The author's name (display name, not @username)
+        2. The main tweet text (the actual post content)
+        
+        Format the output as:
+        Author: [Author Name]
+        Tweet: [Tweet Text]
+        
+        Do not include timestamps, likes, retweets, or any other metadata.
+        If the tweet has images or videos, briefly describe what they show.
+        
+        Return the extracted information in the format specified above.
+        """
+        
+        print(f"Creating Browser Use Agent for: {post_url}")
+        
+        # Create Browser Use agent without structured output for now
+        agent = Agent(
+            task=task,
+            llm=llm,
+            browser_profile=browser_profile,
+        )
+        
+        # Run the agent and get result
+        result = await agent.run()
+        print(f"Browser Use result type: {type(result)}")
+        print(f"Browser Use result: {result}")
+
+        # Debug: print all attributes of result
+        if hasattr(result, '__dict__'):
+            print(f"Result attributes: {list(result.__dict__.keys())}")
+
+        # Try multiple ways to extract the content
+        
+        # Method 1: Check if result has final_result method or attribute
+        if hasattr(result, 'final_result'):
+            final = getattr(result, 'final_result')
+            # Check if it's a method
+            if callable(final):
+                try:
+                    final_value = final()
+                    print(f"Called final_result method, got: {final_value}")
+                    if isinstance(final_value, str) and final_value.strip():
+                        return final_value.strip()
+                except Exception as e:
+                    print(f"Error calling final_result: {e}")
+            else:
+                print(f"Found final_result attribute: {final}")
+                if isinstance(final, str) and final.strip():
+                    return final.strip()
+
+        # Method 2: Check for results in various ways
+        all_results = []
+        
+        # Try direct iteration if result is iterable
+        try:
+            all_results = list(result)
+            print(f"Got results by iterating: {len(all_results)}")
+        except:
+            pass
+        
+        # If that didn't work, try accessing as attribute
+        if not all_results:
+            all_results = getattr(result, 'all_results', []) or []
+            print(f"Got results from all_results attribute: {len(all_results)}")
+        
+        # Also try history attribute
+        if not all_results:
+            history = getattr(result, 'history', None)
+            if history:
+                all_results = getattr(history, 'all_results', []) or []
+                print(f"Got results from history.all_results: {len(all_results)}")
+        
+        print(f"Total results found: {len(all_results)}")
+        
+        for i, action_result in enumerate(all_results):
+            print(f"Result {i}: is_done={getattr(action_result, 'is_done', None)}")
+            if hasattr(action_result, '__dict__'):
+                print(f"  attributes: {list(action_result.__dict__.keys())}")
+            
+            # Check if this is the final result
+            is_done = getattr(action_result, 'is_done', False)
+            if is_done:
+                # Try multiple fields that might contain the text
+                for field in ['extracted_content', 'content', 'text', 'result', 'output']:
+                    value = getattr(action_result, field, None)
+                    if value and isinstance(value, str) and value.strip():
+                        print(f"Found text in {field}: {value}")
+                        return value.strip()
+
+        # Method 3: Check extracted_content on the main result
+        if hasattr(result, 'extracted_content'):
+            content = getattr(result, 'extracted_content')
+            if isinstance(content, str) and content.strip():
+                print(f"Found extracted_content on result: {content}")
+                return content.strip()
+
+        # Method 4: Try to get the last non-empty extracted_content
+        extracted_texts = []
+        for r in all_results:
+            extracted = getattr(r, 'extracted_content', None)
+            if isinstance(extracted, str) and extracted.strip():
+                extracted_texts.append(extracted.strip())
+        
+        if extracted_texts:
+            # Return the last one (likely the final result)
+            final_text = extracted_texts[-1]
+            print(f"Using last extracted_content: {final_text}")
+            return final_text
+
+        # Method 5: Parse the string representation more robustly
+        result_str = str(result)
+        if 'extracted_content' in result_str:
+            print(f"Parsing stringified result")
+            import re
+            # Look for extracted_content in the final ActionResult (where is_done=True)
+            # Pattern to find the last extracted_content (which should be from the done action)
+            pattern = r"ActionResult\(is_done=True.*?extracted_content='([^']+)'.*?\)"
+            match = re.search(pattern, result_str, re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+                print(f"Extracted from string representation: {content[:100]}...")
+                return content
+            
+            # Fallback: just find any extracted_content
+            pattern2 = r"extracted_content='([^']+)'"
+            matches = re.findall(pattern2, result_str)
+            if matches:
+                # Get the last one (likely the final result)
+                content = matches[-1].strip()
+                if content and content != 'Waited for' and not content.startswith('Waited for'):
+                    print(f"Using last extracted_content: {content[:100]}...")
+                    return content
+
+        print("ERROR: Could not extract any text from Browser Use result")
+        return None
+            
+    except Exception as e:
+        print(f"Browser Use extraction error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 # 2) Build a query from extracted post_text + user_note
-QUERY_BUILDER_SYSTEM = """You are QueryBuilder. Build ONE research query for Groq Compound.
+QUERY_BUILDER_SYSTEM = """You are QueryBuilder. Build one detailed but concise research query from the extracted post text and user note.
 Inputs:
 - post_text: extracted social post text (LinkedIn or X)
 - user_note: user's intent
@@ -267,8 +448,14 @@ def api_reports():
 @api.post('/trigger')
 async def trigger(req: Trigger):
     source = _detect_source(req.url)
-    # Step 1: extract post content with Compound Mini
-    post_text = _extract_post_with_kimi(req.url) or ''
+    
+    # Step 1: extract post content - use different methods based on source
+    if source == 'x':
+        # Use Browser Use for X posts
+        post_text = await _extract_x_post_with_browser_use(req.url) or ''
+    else:
+        # Use Compound Mini for LinkedIn posts
+        post_text = _extract_post_with_kimi(req.url) or ''
 
     # Step 2: build query with Kimi from (post_text + user_note)
     query = _shape_query_with_kimi(post_text, req.note) or f"{req.note} (source: {source})"
