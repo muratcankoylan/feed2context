@@ -109,7 +109,7 @@ Then for both:
 
 After clicking the button on a post, you’ll be prompted for a short note. The extension sends `{ url, note }` to the local server, which runs the pipeline and saves the report.
 
-## Prompts (transparency)
+## Prompts 
 
 Extraction prompt for Compound Mini (LinkedIn and X fallback):
 
