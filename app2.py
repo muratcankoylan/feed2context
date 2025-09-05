@@ -35,12 +35,12 @@ def _groq() -> Optional[Groq]:
     return Groq(default_headers={"Groq-Model-Version": "latest"}, api_key=key)
 
 
-# 1) Extract post content with Compound Mini
-EXTRACTOR_SYSTEM = """You are PostExtractor. Visit the given LinkedIn post URL and return ONLY the main post text.
+# 1) Extract post content with Compound Mini (supports LinkedIn and X)
+EXTRACTOR_SYSTEM = """You are PostExtractor. Visit the given social post URL (LinkedIn or X) and return ONLY the main post text.
 Input: {"post_url": "..."}
 Rules:
 - Return ONLY JSON: {"post_text": "..."}
-- Exclude reactions, counts, and comments; include text from 'see more' if applicable
+- Exclude reactions, counts, and comments; include text from 'see more' / collapsed content if applicable
 - If the page is not directly accessible, infer the gist from any preview/snippet and user-visible text
 - No markdown, no extra text
 """
@@ -71,7 +71,7 @@ def _extract_post_with_kimi(post_url: str) -> Optional[str]:
 # 2) Build a query from extracted post_text + user_note
 QUERY_BUILDER_SYSTEM = """You are QueryBuilder. Build ONE research query for Groq Compound.
 Inputs:
-- post_text: extracted LinkedIn post text
+- post_text: extracted social post text (LinkedIn or X)
 - user_note: user's intent
 Process:
 - Identify entities and intent from post_text and user_note
@@ -139,6 +139,15 @@ api.add_middleware(
 class Trigger(BaseModel):
     url: str
     note: str
+
+
+def _detect_source(url: str) -> str:
+    u = (url or '').lower()
+    if 'linkedin.com' in u:
+        return 'linkedin'
+    if 'x.com' in u or 'twitter.com' in u:
+        return 'x'
+    return 'unknown'
 
 
 def _read_reports(limit: int = 100):
@@ -230,12 +239,12 @@ async function load(){
       return `<div class='item'><a href='#' data-idx='${i}'>${preview||'(no query)'}</a><small>${url}</small></div>`;
     }).join('');
     const latest = items[0];
-    document.getElementById('meta').textContent = (latest.post_url||'') + ' — ' + (latest.user_note||'');
+    document.getElementById('meta').textContent = ((latest.source?('['+String(latest.source).toUpperCase()+'] '):'')) + (latest.post_url||'') + ' — ' + (latest.user_note||'');
     setAnswer(latest.compound_answer||'');
     list.addEventListener('click', (e)=>{
       const a = e.target.closest('a[data-idx]'); if(!a) return; e.preventDefault();
       const idx = parseInt(a.getAttribute('data-idx')); const it = items[idx];
-      document.getElementById('meta').textContent = (it.post_url||'') + ' — ' + (it.user_note||'');
+      document.getElementById('meta').textContent = ((it.source?('['+String(it.source).toUpperCase()+'] '):'')) + (it.post_url||'') + ' — ' + (it.user_note||'');
       setAnswer(it.compound_answer||'');
     });
   }catch(err){ 
@@ -257,11 +266,12 @@ def api_reports():
 
 @api.post('/trigger')
 async def trigger(req: Trigger):
+    source = _detect_source(req.url)
     # Step 1: extract post content with Compound Mini
     post_text = _extract_post_with_kimi(req.url) or ''
 
     # Step 2: build query with Kimi from (post_text + user_note)
-    query = _shape_query_with_kimi(post_text, req.note) or f"{req.note} (source: LinkedIn)"
+    query = _shape_query_with_kimi(post_text, req.note) or f"{req.note} (source: {source})"
 
     # Step 3: call Compound
     compound_answer = _compound_search(query)
@@ -271,6 +281,7 @@ async def trigger(req: Trigger):
         'timestamp': datetime.utcnow().isoformat() + 'Z',
         'post_url': req.url,
         'user_note': req.note,
+        'source': source,
         'post_text': post_text,
         'query': query,
         'compound_answer': compound_answer,
@@ -281,6 +292,12 @@ async def trigger(req: Trigger):
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run('app2:api', host='127.0.0.1', port=8001, reload=False)
+    async def _serve_both():
+        config_x = uvicorn.Config('app2:api', host='127.0.0.1', port=8000, reload=False, log_level='info')
+        config_li = uvicorn.Config('app2:api', host='127.0.0.1', port=8001, reload=False, log_level='info')
+        server_x = uvicorn.Server(config_x)
+        server_li = uvicorn.Server(config_li)
+        await asyncio.gather(server_x.serve(), server_li.serve())
+    asyncio.run(_serve_both())
 
 
